@@ -204,4 +204,60 @@ assert {tuple(e["path"]) for e in prop["errors"]} == {
 assert len(db.list_reviews()) == 2  # 仍只有第 5 步创建的两条
 print("7. 配料占比区间顺序校验（收紧/锁定/最短冲突片段/路径定位/只读） OK")
 
+# 8. 原料别名（别名：标准名，有向无环链；仅正式审查 / 时效复核）
+from app.aliases import AliasImportError, parse_and_validate, validate_upsert
+from app.review import analyze as review_analyze
+
+# 8a. 整批原子校验：自环 / 多目标 / 环全部拒绝，并带冲突行与最短环路
+for bad in ("whey：whey", "a：b\na：c", "a：b\nb：a"):
+    try:
+        parse_and_validate(bad)
+        raise AssertionError("应拒绝非法别名批：" + bad)
+    except AliasImportError:
+        pass
+try:
+    parse_and_validate("a：b\nb：c\nc：a")
+except AliasImportError as e:
+    assert e.errors[0]["cycle"] == ["a", "b", "c", "a"], e.errors
+    assert e.errors[0]["lines"] == [1, 2, 3]
+print("8a. 别名整批原子校验（自环/多目标/任意环+最短环路+冲突行） OK")
+
+# 8b. 合法链入库：whey→乳清粉；高钙脱脂奶粉→脱脂奶粉→奶粉
+n = db.replace_aliases(parse_and_validate(
+    "whey：乳清粉\n脱脂奶粉：奶粉\n高钙脱脂奶粉：脱脂奶粉"))
+assert n == 3
+# 单条写入跨批次防环：让乳清粉回指 whey 会成环，拒绝
+assert validate_upsert("乳清粉", "whey", db.alias_map(), db.alias_display_map())
+
+# 8c. 正式审查按最终标准名查字典，但树 / 路径保留原始名
+ares, afp = review_analyze(
+    text_a="配料表：高钙脱脂奶粉，whey，神秘香精", text_b=None,
+    label_a="现版配方", label_b="新版配方", declared=[])
+names = [x["name"] for x in ares["version_a"]["tree"]]
+assert names == ["高钙脱脂奶粉", "whey", "神秘香精"], names
+assert set(ares["version_a"]["allergens"]) == {"乳"}
+assert ares["label_check"]["missing_sources"]["乳"] == \
+    [["whey"], ["高钙脱脂奶粉"]]
+assert ares["version_a"]["unknown_ingredients"] == ["神秘香精"]
+print("8c. 别名链解析到最终标准名查字典 / 树与路径保留原始名 OK")
+
+# 8d. 别名变化的时效判定：仅实际原料最终标准名或其过敏原映射改变才失效
+sres, sfp = review_analyze(
+    text_a="配料表：高钙脱脂奶粉，whey", text_b=None,
+    label_a="现版配方", label_b="新版配方", declared=[])
+arid = db.create_review(
+    name="别名审查", declared=[],
+    text_a="配料表：高钙脱脂奶粉，whey", text_b=None,
+    label_a="现版配方", label_b="新版配方",
+    result=sres, dict_fingerprint=sfp)
+assert db.get_review(arid)["needs_recheck"] is False
+# 无关别名变化不失效
+db.replace_aliases(parse_and_validate(
+    "whey：乳清粉\n脱脂奶粉：奶粉\n高钙脱脂奶粉：脱脂奶粉\n无关名：食盐"))
+assert db.get_review(arid)["needs_recheck"] is False
+# 删除别名链：高钙脱脂奶粉 / whey 退回未登记叶子 → 失效
+db.replace_aliases(parse_and_validate(""))
+assert db.get_review(arid)["needs_recheck"] is True
+print("8d. 别名规则变化的时效复核判定（无关不误报 / 目标改变才失效） OK")
+
 print("\n全部集成冒烟测试通过 ✔")

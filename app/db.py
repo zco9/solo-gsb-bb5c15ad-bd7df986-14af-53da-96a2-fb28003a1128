@@ -9,6 +9,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
 
+from . import aliases as alias_mod
 from .analysis import missing_allergen_sources, normalize_name
 from .fingerprint import result_keys, scoped_fingerprint
 
@@ -21,6 +22,11 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS allergen_dict (
     ingredient TEXT PRIMARY KEY,
     allergens  TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ingredient_aliases (
+    alias      TEXT PRIMARY KEY,
+    target     TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS reviews (
@@ -113,6 +119,67 @@ def bulk_import(text: str) -> int:
     return count
 
 
+# ---------- 原料别名（别名：标准名，有向无环图） ----------
+
+def list_aliases() -> List[dict]:
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT alias, target, updated_at FROM ingredient_aliases "
+            "ORDER BY alias").fetchall()
+    return [{"alias": r["alias"], "target": r["target"],
+             "updated_at": r["updated_at"]} for r in rows]
+
+
+def alias_map() -> Dict[str, str]:
+    """{归一化别名: 归一化标准名}，供别名链解析使用。"""
+    return {normalize_name(a["alias"]): normalize_name(a["target"])
+            for a in list_aliases()}
+
+
+def alias_display_map() -> Dict[str, str]:
+    """{归一化名: 原始展示名}（别名与标准名统一命名空间，首次出现者为准）。"""
+    names: Dict[str, str] = {}
+    for a in list_aliases():
+        names.setdefault(normalize_name(a["target"]), a["target"])
+        names.setdefault(normalize_name(a["alias"]), a["alias"])
+    return names
+
+
+def replace_aliases(entries: List[alias_mod.AliasEntry]) -> int:
+    """整批原子替换别名表：校验已通过，同事务清空重写，失败整批不生效。
+
+    同一别名重复指向相同标准名（可能写法上有空白差异）只保留首次出现。
+    """
+    unique: Dict[str, tuple] = {}
+    for e in entries:
+        unique.setdefault(normalize_name(e.alias), (e.alias, e.target))
+    now = _now()
+    rows = [(alias, target, now) for alias, target in unique.values()]
+    with _lock, _connect() as conn:
+        conn.execute("DELETE FROM ingredient_aliases")
+        conn.executemany(
+            "INSERT INTO ingredient_aliases (alias, target, updated_at) "
+            "VALUES (?, ?, ?)", rows)
+    return len(rows)
+
+
+def upsert_alias(alias: str, target: str) -> None:
+    """新增 / 更新单条别名。调用方需先用 aliases.validate_upsert 校验。"""
+    with _lock, _connect() as conn:
+        conn.execute(
+            "INSERT INTO ingredient_aliases (alias, target, updated_at) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(alias) DO UPDATE SET "
+            "target=excluded.target, updated_at=excluded.updated_at",
+            (alias, target, _now()))
+
+
+def delete_alias(alias: str) -> None:
+    with _lock, _connect() as conn:
+        conn.execute("DELETE FROM ingredient_aliases WHERE alias = ?",
+                     (alias,))
+
+
 # ---------- 审查记录 ----------
 
 def create_review(*, name: str, declared: List[str], text_a: str,
@@ -155,20 +222,24 @@ def _row_to_review(row: sqlite.Row) -> dict:
     }
 
 
-def _recheck_status(r: dict, dictionary: Optional[Dict[str, Set[str]]] = None):
+def _recheck_status(r: dict, dictionary: Optional[Dict[str, Set[str]]] = None,
+                    aliases: Optional[Dict[str, str]] = None):
     """计算记录的字典时效状态。
 
     返回 (needs_recheck, reason)：
     - 无指纹（升级前旧记录）→ (True, "legacy")，按需复核；
-    - 以记录结果中 A/B 配料树实际涉及的原料对当前字典重算指纹，
-      与保存值不一致 → (True, "stale")；
-    - 一致 → (False, None)。配方未涉及的原料变化不会影响指纹。
+    - 以记录结果中 A/B 配料树实际涉及的原料（经当前别名链解析到最终
+      标准名）对当前字典重算指纹，与保存值不一致 → (True, "stale")；
+    - 一致 → (False, None)。别名规则变化后，只有当记录实际原料解析出的
+      最终标准名、或其过敏原映射改变时才失效；无关别名变化不会误报。
     """
     saved = r.get("dict_fingerprint")
     if not saved:
         return True, "legacy"
     dictionary = dict_lookup() if dictionary is None else dictionary
-    current = scoped_fingerprint(result_keys(r.get("result") or {}), dictionary)
+    aliases = alias_map() if aliases is None else aliases
+    current = scoped_fingerprint(
+        result_keys(r.get("result") or {}, aliases), dictionary)
     if current != saved:
         return True, "stale"
     return False, None
@@ -204,7 +275,7 @@ def get_review(rid: int) -> Optional[dict]:
     if not row:
         return None
     r = _backfill_missing_sources(_row_to_review(row))
-    needs, reason = _recheck_status(r)
+    needs, reason = _recheck_status(r, aliases=alias_map())
     r["needs_recheck"] = needs
     r["recheck_reason"] = reason
     return r
@@ -214,13 +285,14 @@ def list_reviews() -> List[dict]:
     with _lock, _connect() as conn:
         rows = conn.execute(
             "SELECT * FROM reviews ORDER BY id DESC").fetchall()
-    # 一次取出当前字典供全部记录比对，避免逐条查询
+    # 一次取出当前字典与别名供全部记录比对，避免逐条查询
     dictionary = dict_lookup()
+    aliases = alias_map()
     reviews = []
     for row in rows:
         r = _row_to_review(row)
         check = r["result"].get("label_check", {})
-        needs, reason = _recheck_status(r, dictionary)
+        needs, reason = _recheck_status(r, dictionary, aliases)
         reviews.append({
             "id": r["id"], "name": r["name"], "created_at": r["created_at"],
             "has_two_versions": bool(r["text_b"]),

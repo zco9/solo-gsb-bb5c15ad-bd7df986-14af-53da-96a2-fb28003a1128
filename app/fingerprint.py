@@ -1,9 +1,12 @@
-"""字典时效：过敏原字典的稳定指纹（按配方实际涉及的原料取子集）。
+"""字典时效：过敏原字典的稳定指纹（按配方实际涉及原料取子集）。
 
-复核失效判定只关心审查记录配方中真实出现的原料映射，因此：
+参与指纹的原料名先经**别名链解析到最终标准名**，因此：
 
-- 指纹只包含配方配料树中出现过的原料（含复合父配料），配方未涉及的
-  原料增删改不影响指纹，不会误报；
+- 指纹只包含配方配料树中出现过的原料（含复合父配料）解析后的标准名，
+  配方未涉及的原料增删改不影响指纹，不会误报；
+- 别名规则变化时，只有当某条记录实际原料解析出的最终标准名改变（指纹
+  key 变化）、或该标准名对应的过敏原映射变化，指纹才不一致并标记复核；
+  与本记录无关的别名增删、别名展示顺序变化都不会误报；
 - 参与哈希的原料名与过敏原列表均排序后序列化，字典存储/展示顺序调整
   不会改变指纹；
 - 原料是否已在字典中登记（present / absent）本身也是映射的一部分，
@@ -14,38 +17,46 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Dict, Iterable, Set
+from typing import Dict, Iterable, Optional, Set
 
-from .analysis import flatten, normalize_name
+from .analysis import flatten, normalize_name, resolve_alias
 from .parser import parse_recipe
 
 # 指纹算法版本：未来指纹口径调整时可区分代际
 FP_VERSION = "v1"
 
 
-def dict_tree_keys(nodes: Iterable[dict]) -> Set[str]:
-    """从已持久化的配料树（节点 dict）收集全部归一化原料名。"""
+def _resolve_keys(names: Iterable[str],
+                  aliases: Optional[Dict[str, str]]) -> Set[str]:
+    return {resolve_alias(normalize_name(name), aliases) for name in names if name}
+
+
+def dict_tree_keys(nodes: Iterable[dict],
+                   aliases: Optional[Dict[str, str]] = None) -> Set[str]:
+    """从已持久化的配料树（节点 dict）收集全部原料，返回解析后的最终标准名。"""
     keys: Set[str] = set()
     for node in nodes:
         name = node.get("name", "")
         if name:
-            keys.add(normalize_name(name))
-        keys |= dict_tree_keys(node.get("children", []))
+            keys.add(resolve_alias(normalize_name(name), aliases))
+        keys |= dict_tree_keys(node.get("children", []), aliases)
     return keys
 
 
-def recipe_keys(text: str) -> Set[str]:
-    """解析配方文本，收集其中全部原料（含复合父配料）的归一化名。"""
+def recipe_keys(text: str,
+                aliases: Optional[Dict[str, str]] = None) -> Set[str]:
+    """解析配方文本，收集其中全部原料（含复合父配料）解析后的最终标准名。"""
     tree = parse_recipe(text)
-    return {normalize_name(n.name) for n in flatten(tree) if n.name}
+    return _resolve_keys((n.name for n in flatten(tree) if n.name), aliases)
 
 
-def result_keys(result: dict) -> Set[str]:
-    """从审查结果的 A/B 配料树中收集全部归一化原料名。"""
+def result_keys(result: dict,
+                aliases: Optional[Dict[str, str]] = None) -> Set[str]:
+    """从审查结果的 A/B 配料树中收集全部原料解析后的最终标准名。"""
     keys: Set[str] = set()
     for version in (result.get("version_a"), result.get("version_b")):
         if version:
-            keys |= dict_tree_keys(version.get("tree", []))
+            keys |= dict_tree_keys(version.get("tree", []), aliases)
     return keys
 
 

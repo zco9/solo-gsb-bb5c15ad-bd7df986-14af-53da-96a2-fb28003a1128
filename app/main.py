@@ -2,6 +2,7 @@
 
 功能：
 - 过敏原字典管理（原料 → 过敏原集合）；
+- 原料别名管理（别名 → 标准名，有向无环链，仅接入正式审查与时效复核）；
 - 解析带嵌套子配料的配方文本，传播并汇总过敏原；
 - 对照标签声明，指出遗漏 / 多报的过敏原；
 - 支持两版配方对比，输出过敏原变化；
@@ -19,6 +20,8 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from . import db
+from .aliases import (AliasImportError, build_resolution_preview,
+                      parse_and_validate, validate_upsert)
 from .proportion import analyze_proportions
 from .recheck import build_recheck
 from .report import render_html_report, render_markdown_report
@@ -41,7 +44,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="食品过敏原标签审查台", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="食品过敏原标签审查台", version="1.1.0", lifespan=lifespan)
 
 
 # ---------- 请求模型 ----------
@@ -52,6 +55,19 @@ class DictEntry(BaseModel):
 
 
 class BulkImport(BaseModel):
+    text: str
+
+
+class AliasEntryIn(BaseModel):
+    alias: str
+    target: str
+
+
+class BulkAliases(BaseModel):
+    text: str
+
+
+class AliasPreview(BaseModel):
     text: str
 
 
@@ -118,6 +134,62 @@ def delete_entry(ingredient: str):
 def bulk_import(payload: BulkImport):
     imported = db.bulk_import(payload.text)
     return {"ok": True, "imported": imported}
+
+
+# ---------- 原料别名（仅接入正式审查与字典时效复核） ----------
+
+@app.get("/api/aliases")
+def get_aliases():
+    return {"aliases": db.list_aliases()}
+
+
+@app.post("/api/aliases/bulk")
+def bulk_aliases(payload: BulkAliases):
+    """整批原子维护「别名：标准名」。
+
+    把整批映射视为有向图统一校验：自环、同一别名多目标、任意长度环
+    （返回冲突行号与最短环路）任一存在即整批拒绝（HTTP 400），
+    不写入任何数据；全部合法时在一个事务内替换现有别名集。
+    """
+    try:
+        entries = parse_and_validate(payload.text)
+    except AliasImportError as exc:
+        raise HTTPException(400, {"message": str(exc), "errors": exc.errors})
+    count = db.replace_aliases(entries)
+    return {"ok": True, "imported": count}
+
+
+@app.post("/api/aliases")
+def upsert_alias(payload: AliasEntryIn):
+    alias, target = payload.alias.strip(), payload.target.strip()
+    if not alias or not target:
+        raise HTTPException(400, "别名与标准名均不能为空")
+    errors = validate_upsert(alias, target, db.alias_map(),
+                             db.alias_display_map())
+    if errors:
+        raise HTTPException(400, {"message": str(errors[0]["message"]),
+                                  "errors": errors})
+    db.upsert_alias(alias, target)
+    return {"ok": True}
+
+
+@app.delete("/api/aliases/{alias}")
+def remove_alias(alias: str):
+    db.delete_alias(alias)
+    return {"ok": True}
+
+
+@app.post("/api/alias-resolve-preview")
+def alias_resolve_preview(payload: AliasPreview):
+    """别名链解析预览（只读）：把配方中每种原料沿别名链解析到最终标准名。
+
+    返回每种原料的解析链、最终标准名、是否已在字典登记及其过敏原；
+    只用于页面预览，不改变配方树（树与遗漏路径始终显示原始名称）。
+    """
+    if not payload.text.strip():
+        raise HTTPException(400, "配方文本不能为空")
+    return build_resolution_preview(
+        payload.text, db.alias_map(), db.alias_display_map(), db.dict_lookup())
 
 
 # ---------- 供应商方案风险区间（临时预览） ----------

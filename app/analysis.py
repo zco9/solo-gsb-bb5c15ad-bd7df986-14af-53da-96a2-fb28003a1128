@@ -11,16 +11,34 @@ def normalize_name(name: str) -> str:
     return "".join(name.split()).lower()
 
 
+def resolve_alias(key: str, aliases: Optional[Dict[str, str]]) -> str:
+    """沿别名有向边解析到最终标准名（key 必须已归一化）。
+
+    别名图在写入时经过无环校验，故循环必然终止；节点名称（树、路径、
+    指纹涉及面以外的展示）仍保留原始名，本函数只影响字典查询目标。
+    """
+    if not aliases:
+        return key
+    seen = set()
+    while key in aliases and key not in seen:
+        seen.add(key)
+        key = aliases[key]
+    return key
+
+
 def attach_allergens(nodes: List[IngredientNode],
-                     dictionary: Dict[str, Set[str]]) -> List[IngredientNode]:
+                     dictionary: Dict[str, Set[str]],
+                     aliases: Optional[Dict[str, str]] = None) -> List[IngredientNode]:
     """按字典标注每种原料的过敏原，并把子配料的过敏原向上传播。
 
-    dictionary 的 key 必须是 normalize_name 之后的形式。
+    dictionary 的 key 与 aliases 的 key/value 必须是 normalize_name 之后的
+    形式。原料先经别名链解析到**最终标准名**再查字典；节点的原始名称
+    保持不变，因此配方树与遗漏来源路径展示的仍是用户书写的原始名称。
     """
     for node in nodes:
-        key = normalize_name(node.name)
+        key = resolve_alias(normalize_name(node.name), aliases)
         node.own_allergens = set(dictionary.get(key, set()))
-        attach_allergens(node.children, dictionary)
+        attach_allergens(node.children, dictionary, aliases)
         total = set(node.own_allergens)
         for child in node.children:
             total |= child.total_allergens
