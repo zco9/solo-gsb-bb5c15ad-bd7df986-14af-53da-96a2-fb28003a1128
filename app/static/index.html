@@ -117,7 +117,26 @@
 </section>
 
 <section>
-  <h2>② 新建标签审查</h2>
+  <h2>② 原料别名</h2>
+  <p class="hint">每行一条 <code>别名：标准名</code>（冒号中英文均可，# 开头为注释），支持任意长度链
+    <code>脱盐乳清：乳清粉</code>、<code>乳清粉：奶粉</code>，审查时解析到<b>最终标准名</b>再查字典；
+    配料树与遗漏来源路径仍显示原料原始名称。整批原子校验：自环、任意长度环、同一别名多目标都会
+    <b>整批拒绝</b>，错误给出冲突行，环给出最短环路。别名<b>仅用于正式审查与字典时效复核</b>，
+    不影响下方两个临时预览。</p>
+  <textarea id="alias-text" rows="4"
+    placeholder="脱盐乳清：乳清粉&#10;浓缩乳清蛋白：乳清粉&#10;whey powder：乳清粉"></textarea>
+  <div class="toolbar">
+    <button onclick="importAliases()">批量保存别名</button>
+    <button class="ghost" onclick="submitAliasPreview()">解析预览（按下方配方 A）</button>
+    <span id="alias-msg" class="hint"></span>
+  </div>
+  <div id="alias-error" class="error" style="white-space:pre-wrap;margin-top:6px"></div>
+  <div id="alias-table-wrap" style="margin-top:10px"></div>
+  <div id="alias-preview-wrap" style="margin-top:10px"></div>
+</section>
+
+<section>
+  <h2>③ 新建标签审查</h2>
   <label>审查名称</label>
   <input type="text" id="review-name" placeholder="例如：巧克力饼干 标签审查">
   <div class="row">
@@ -145,7 +164,7 @@
 </section>
 
 <section>
-  <h2>③ 供应商方案风险区间 <span class="pill gray">临时预览</span></h2>
+  <h2>④ 供应商方案风险区间 <span class="pill gray">临时预览</span></h2>
   <p class="hint">为配方中的若干原料输入<b>互斥</b>供应商方案：每行一条
     <code>原料：方案1；方案2</code>，方案内逗号分隔过敏原，空方案写「无」；
     未覆盖原料沿用上方字典。后端不枚举方案组合，而是在配料树上分别传播
@@ -175,7 +194,7 @@
 </section>
 
 <section>
-  <h2>④ 配料占比区间顺序校验 <span class="pill gray">临时预览</span></h2>
+  <h2>⑤ 配料占比区间顺序校验 <span class="pill gray">临时预览</span></h2>
   <p class="hint">在每个原料名后标注占比区间：<code>奶粉[8-12%]</code>，单值写
     <code>食盐[2%]</code>；父配料先标注再跟子配料括号，如
     <code>巧克力酱[25-60%]（可可脂[10-18%]）</code>。按标签书写顺序校验每组同级配料的
@@ -195,7 +214,7 @@
 </section>
 
 <section id="result-section" class="hidden">
-  <h2>⑤ 审查结果 <span id="result-title" class="hint"></span></h2>
+  <h2>⑥ 审查结果 <span id="result-title" class="hint"></span></h2>
   <div id="recheck-bar"></div>
   <div id="recheck-panel" class="recheck-panel hidden"></div>
   <div id="result-body"></div>
@@ -206,7 +225,7 @@
 </section>
 
 <section>
-  <h2>⑥ 历史审查记录</h2>
+  <h2>⑦ 历史审查记录</h2>
   <div id="history-table"><p class="hint">暂无记录</p></div>
 </section>
 
@@ -219,6 +238,7 @@ const esc = s => String(s).replace(/[&<>"']/g,
 
 let presets = [];
 let dictEntries = [];
+let aliasEntries = [];
 let customAllergens = [];
 let currentReviewId = null;
 
@@ -239,8 +259,15 @@ async function api(path, opts = {}) {
   const res = await fetch(path, opts);
   if (!res.ok) {
     let msg = res.statusText;
-    try { msg = (await res.json()).detail || msg; } catch (e) {}
-    throw new Error(msg);
+    let detail = null;
+    try {
+      const body = await res.json();
+      detail = body.detail;
+      msg = (detail && detail.message) || (typeof detail === 'string' ? detail : msg);
+    } catch (e) {}
+    const err = new Error(msg);
+    err.detail = detail;
+    throw err;
   }
   return res.json();
 }
@@ -254,6 +281,12 @@ async function loadDict() {
   presets = p.allergens;
   renderDict();
   renderDeclaredBox();
+}
+
+async function deleteEntry(name) {
+  await api('/api/dict/' + encodeURIComponent(name), {method: 'DELETE'});
+  await loadDict();
+  await loadHistory();
 }
 
 function renderDict() {
@@ -281,6 +314,92 @@ async function deleteEntry(name) {
   await api('/api/dict/' + encodeURIComponent(name), {method: 'DELETE'});
   await loadDict();
   await loadHistory();
+}
+
+/* ---------- 原料别名 ---------- */
+async function loadAliases() {
+  const d = await api('/api/aliases');
+  aliasEntries = d.aliases;
+  renderAliases();
+}
+
+function renderAliases() {
+  if (!aliasEntries.length) {
+    $('alias-table-wrap').innerHTML = '<p class="hint">暂无别名，配方中的原料名将直接查字典。</p>';
+    return;
+  }
+  const rows = aliasEntries.map(a =>
+    `<tr><td>${esc(a.alias)}</td><td class="hint">→</td><td>${esc(a.target)}</td>
+     <td><a class="link" onclick="deleteAlias('${esc(a.alias)}')">删除</a></td></tr>`).join('');
+  $('alias-table-wrap').innerHTML =
+    `<table><tr><th style="width:34%">别名</th><th style="width:32px"></th><th>标准名</th>
+     <th style="width:60px">操作</th></tr>${rows}</table>`;
+}
+
+const ALIAS_ERR_LABEL = {
+  format: '格式错误', multi_target: '同一别名多目标',
+  self_loop: '自环', cycle: '环路',
+};
+
+async function importAliases() {
+  $('alias-error').textContent = '';
+  $('alias-msg').textContent = '';
+  try {
+    const r = await post('/api/aliases/bulk', {text: $('alias-text').value});
+    $('alias-msg').textContent = `已保存 ${r.imported} 条别名`;
+    await loadAliases();
+    await loadHistory();
+  } catch (e) {
+    const errs = (e.detail && e.detail.errors) || [];
+    $('alias-error').textContent = errs.length
+      ? errs.map(x => `· [${ALIAS_ERR_LABEL[x.type] || x.type}] ${x.message}`).join('\n')
+      : e.message;
+  }
+}
+
+async function deleteAlias(name) {
+  await api('/api/aliases/' + encodeURIComponent(name), {method: 'DELETE'});
+  await loadAliases();
+  await loadHistory();
+}
+
+async function submitAliasPreview() {
+  const wrap = $('alias-preview-wrap');
+  wrap.innerHTML = '<p class="hint">解析中…</p>';
+  try {
+    const r = await post('/api/aliases/resolve-preview', {text: $('text-a').value});
+    renderAliasPreview(r.items);
+  } catch (e) {
+    wrap.innerHTML = `<p class="error">${esc(e.message)}</p>`;
+  }
+}
+
+function renderAliasPreview(items) {
+  if (!items.length) {
+    $('alias-preview-wrap').innerHTML = '<p class="hint">未从配方文本解析到原料。</p>';
+    return;
+  }
+  const rows = items.map(it => {
+    const chain = it.chain.map((n, i) =>
+      (i === it.chain.length - 1
+        ? `<b>${esc(n)}</b>` : esc(n)) +
+      (i < it.chain.length - 1 ? ' <span class="src-arrow">→</span> ' : '')
+    ).join('');
+    const tag = it.resolved ? '<span class="pill blue">别名解析</span>' : '';
+    const dictTag = it.in_dict
+      ? (it.allergens.length
+        ? it.allergens.map(a => `<span class="badge ok">${esc(a)}</span>`).join('')
+        : '<span class="hint">已登记（无过敏原）</span>')
+      : (it.is_leaf
+        ? '<span class="pill orange">最终标准名未登记</span>'
+        : '<span class="hint">复合配料，过敏原来自子配料</span>');
+    return `<tr><td>${esc(it.name)} ${tag}</td><td>${chain}</td><td>${dictTag}</td></tr>`;
+  }).join('');
+  $('alias-preview-wrap').innerHTML =
+    `<div class="result-block"><h3>别名解析预览（按配方文本 A）</h3>
+     <p class="hint">审查时按最终标准名查字典并计算指纹；配方树与遗漏来源路径仍显示左侧原始名称。</p>
+     <table><tr><th style="width:26%">配方原始名</th><th style="width:38%">解析链 → 最终标准名</th>
+     <th>最终标准名字典</th></tr>${rows}</table></div>`;
 }
 
 /* ---------- 声明过敏原勾选 ---------- */
@@ -823,7 +942,8 @@ async function fillDemo() {
   $('dict-msg').textContent = '示例已填充，点击“开始审查”查看效果';
 }
 
-loadDict().then(loadHistory).catch(e => alert('初始化失败：' + e.message));
+loadDict().then(() => Promise.all([loadHistory(), loadAliases()]))
+  .catch(e => alert('初始化失败：' + e.message));
 </script>
 </body>
 </html>

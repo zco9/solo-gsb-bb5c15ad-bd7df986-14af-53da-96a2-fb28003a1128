@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set
 
 from .analysis import missing_allergen_sources, normalize_name
+from .aliases import AliasResolver
 from .fingerprint import result_keys, scoped_fingerprint
 
 DB_PATH = os.environ.get("DB_PATH") or os.path.abspath(
@@ -22,6 +23,13 @@ CREATE TABLE IF NOT EXISTS allergen_dict (
     ingredient TEXT PRIMARY KEY,
     allergens  TEXT NOT NULL DEFAULT '[]',
     updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ingredient_aliases (
+    alias_key   TEXT PRIMARY KEY,
+    alias_name  TEXT NOT NULL,
+    target_key  TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS reviews (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,6 +121,70 @@ def bulk_import(text: str) -> int:
     return count
 
 
+# ---------- 原料别名 ----------
+
+def list_aliases() -> List[dict]:
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT alias_name, target_name FROM ingredient_aliases "
+            "ORDER BY alias_name").fetchall()
+    return [{"alias": r["alias_name"], "target": r["target_name"]}
+            for r in rows]
+
+
+def alias_edges() -> Dict[str, str]:
+    """{归一化别名: 归一化标准名} 有向图出边（已通过整批校验，理应无环）。"""
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT alias_key, target_key FROM ingredient_aliases").fetchall()
+    return {r["alias_key"]: r["target_key"] for r in rows}
+
+
+def alias_existing() -> Dict[str, tuple]:
+    """{归一化别名: (别名展示名, 标准名展示名)}，供整批校验引用既有映射。"""
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT alias_key, alias_name, target_name FROM ingredient_aliases"
+        ).fetchall()
+    return {r["alias_key"]: (r["alias_name"], r["target_name"]) for r in rows}
+
+
+def alias_resolver() -> AliasResolver:
+    """当前别名规则的解析器（key 沿出边解析到最终标准名 key）。"""
+    return AliasResolver(alias_edges())
+
+
+def bulk_upsert_aliases(entries: List[tuple]) -> int:
+    """整批写入已通过校验的别名（原子 upsert）。
+
+    entries 为 ``(别名原文, 标准名原文)``；归一化后别名相同的条目只写一条。
+    返回写入条数。调用方必须先用 :func:`aliases.validate_alias_batch` 完成
+    整批原子校验（自环 / 任意长度环 / 同一别名多目标均拒绝）。
+    """
+    now = _now()
+    deduped: Dict[str, tuple] = {}
+    for alias, target in entries:
+        deduped.setdefault(
+            normalize_name(alias), (alias, target))
+    with _lock, _connect() as conn:
+        for key, (alias, target) in deduped.items():
+            conn.execute(
+                "INSERT INTO ingredient_aliases "
+                "(alias_key, alias_name, target_key, target_name, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(alias_key) DO UPDATE SET "
+                "alias_name=excluded.alias_name, target_key=excluded.target_key, "
+                "target_name=excluded.target_name, updated_at=excluded.updated_at",
+                (key, alias, normalize_name(target), target, now))
+    return len(deduped)
+
+
+def delete_alias(alias: str) -> None:
+    with _lock, _connect() as conn:
+        conn.execute("DELETE FROM ingredient_aliases WHERE alias_key = ?",
+                     (normalize_name(alias),))
+
+
 # ---------- 审查记录 ----------
 
 def create_review(*, name: str, declared: List[str], text_a: str,
@@ -155,20 +227,26 @@ def _row_to_review(row: sqlite.Row) -> dict:
     }
 
 
-def _recheck_status(r: dict, dictionary: Optional[Dict[str, Set[str]]] = None):
+def _recheck_status(r: dict, dictionary: Optional[Dict[str, Set[str]]] = None,
+                    resolver: Optional[AliasResolver] = None):
     """计算记录的字典时效状态。
 
     返回 (needs_recheck, reason)：
     - 无指纹（升级前旧记录）→ (True, "legacy")，按需复核；
-    - 以记录结果中 A/B 配料树实际涉及的原料对当前字典重算指纹，
-      与保存值不一致 → (True, "stale")；
-    - 一致 → (False, None)。配方未涉及的原料变化不会影响指纹。
+    - 以记录结果中 A/B 配料树实际涉及的原料（按当前别名规则解析到最终
+      标准名）对当前字典重算指纹，与保存值不一致 → (True, "stale")；
+    - 一致 → (False, None)。配方未涉及的原料变化不会影响指纹；别名规则
+      改变但最终标准名与其过敏原映射不变时同样不标需复核。
     """
     saved = r.get("dict_fingerprint")
     if not saved:
         return True, "legacy"
-    dictionary = dict_lookup() if dictionary is None else dictionary
-    current = scoped_fingerprint(result_keys(r.get("result") or {}), dictionary)
+    if dictionary is None:
+        dictionary = dict_lookup()
+    if resolver is None:
+        resolver = alias_resolver()
+    current = scoped_fingerprint(
+        result_keys(r.get("result") or {}), dictionary, resolver.resolve)
     if current != saved:
         return True, "stale"
     return False, None
@@ -214,13 +292,14 @@ def list_reviews() -> List[dict]:
     with _lock, _connect() as conn:
         rows = conn.execute(
             "SELECT * FROM reviews ORDER BY id DESC").fetchall()
-    # 一次取出当前字典供全部记录比对，避免逐条查询
+    # 一次取出当前字典与别名规则供全部记录比对，避免逐条查询
     dictionary = dict_lookup()
+    resolver = alias_resolver()
     reviews = []
     for row in rows:
         r = _row_to_review(row)
         check = r["result"].get("label_check", {})
-        needs, reason = _recheck_status(r, dictionary)
+        needs, reason = _recheck_status(r, dictionary, resolver)
         reviews.append({
             "id": r["id"], "name": r["name"], "created_at": r["created_at"],
             "has_two_versions": bool(r["text_b"]),

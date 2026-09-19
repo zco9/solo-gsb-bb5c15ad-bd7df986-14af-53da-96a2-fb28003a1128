@@ -1,7 +1,7 @@
 """过敏原传播、标签核对与版本比对。"""
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Callable, Dict, Iterable, List, Optional, Set
 
 from .parser import IngredientNode
 
@@ -12,21 +12,27 @@ def normalize_name(name: str) -> str:
 
 
 def attach_allergens(nodes: List[IngredientNode],
-                     dictionary: Dict[str, Set[str]]) -> List[IngredientNode]:
+                     dictionary: Dict[str, Set[str]],
+                     resolve: Optional[Callable[[str], str]] = None
+                     ) -> List[IngredientNode]:
     """按字典标注每种原料的过敏原，并把子配料的过敏原向上传播。
 
     dictionary 的 key 必须是 normalize_name 之后的形式。
+    传入 resolve 时（原料别名链解析），先把原料归一化名解析到**最终
+    标准名**再查字典；节点 ``name`` 始终保留配方中的原始名称，
+    因此配料树与遗漏来源路径展示的仍是用户录入的原料名。
     """
     for node in nodes:
         key = normalize_name(node.name)
-        node.own_allergens = set(dictionary.get(key, set()))
-        attach_allergens(node.children, dictionary)
+        standard = resolve(key) if resolve is not None else key
+        node.own_allergens = set(dictionary.get(standard, set()))
+        attach_allergens(node.children, dictionary, resolve)
         total = set(node.own_allergens)
         for child in node.children:
             total |= child.total_allergens
         node.total_allergens = total
         # 只有叶子原料才提示“未识别”；复合原料的过敏原来自子配料
-        node.unknown = key not in dictionary and not node.children
+        node.unknown = standard not in dictionary and not node.children
     return nodes
 
 

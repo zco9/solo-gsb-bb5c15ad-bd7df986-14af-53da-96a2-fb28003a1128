@@ -204,4 +204,65 @@ assert {tuple(e["path"]) for e in prop["errors"]} == {
 assert len(db.list_reviews()) == 2  # 仍只有第 5 步创建的两条
 print("7. 配料占比区间顺序校验（收紧/锁定/最短冲突片段/路径定位/只读） OK")
 
+# 8. 原料别名（仅接入正式审查与字典时效复核）
+from app.aliases import validate_alias_batch  # noqa: E402
+from app.review import analyze  # noqa: E402
+
+# 8a. 整批原子校验：自环 / 任意长度环 / 同一别名多目标全部拒绝且不写入
+bad = validate_alias_batch("脱盐乳清：脱盐乳清", db.alias_existing())
+assert bad["errors"] and bad["errors"][0]["type"] == "self_loop"
+bad = validate_alias_batch("甲：乙\n乙：丙\n丙：甲", db.alias_existing())
+assert bad["errors"][0]["type"] == "cycle"
+assert bad["errors"][0]["cycle"] == ["甲", "乙", "丙", "甲"]
+assert bad["errors"][0]["lines"] == [1, 2, 3]
+bad = validate_alias_batch("脱盐乳清：乳清粉\n脱盐乳清：奶粉",
+                           db.alias_existing())
+assert [e["type"] for e in bad["errors"]] == ["multi_target"]
+assert bad["entries"] == []
+assert db.list_aliases() == []  # 拒绝整批，库内无任何别名
+
+# 8b. 合法别名链写入：脱盐乳清 -> 乳清粉（-> 最终标准名即乳清粉）
+ok = validate_alias_batch("脱盐乳清：乳清粉", db.alias_existing())
+assert not ok["errors"] and ok["entries"] == [("脱盐乳清", "乳清粉")]
+db.bulk_upsert_aliases(ok["entries"])
+resolver = db.alias_resolver()
+assert resolver.resolve("脱盐乳清") == "乳清粉"
+
+# 8c. 正式审查：别名链解析到最终标准名参与字典查询，但树/路径保留原名
+result_alias, fp_alias = analyze(
+    text_a="配料表：小麦粉，巧克力酱（脱盐乳清），鸡蛋",
+    text_b=None, label_a="现版配方", label_b="新版配方",
+    declared=["麸质谷物", "蛋类"])
+assert "乳" in result_alias["version_a"]["allergens"]
+assert "脱盐乳清" not in result_alias["version_a"]["unknown_ingredients"]
+tree_names = result_alias["version_a"]["tree"]
+assert tree_names[1]["name"] == "巧克力酱"
+assert tree_names[1]["children"][0]["name"] == "脱盐乳清"  # 原始名称
+assert result_alias["label_check"]["missing_sources"]["乳"] == \
+    [["巧克力酱", "脱盐乳清"]]
+rid_alias = db.create_review(
+    name="别名审查", declared=["麸质谷物", "蛋类"],
+    text_a="配料表：小麦粉，巧克力酱（脱盐乳清），鸡蛋", text_b=None,
+    label_a="现版配方", label_b="新版配方",
+    result=result_alias, dict_fingerprint=fp_alias)
+assert db.get_review(rid_alias)["needs_recheck"] is False
+
+# 8d. 别名规则变化但最终标准名/映射不变（缩短等价链路）不复核；
+#     改写为不同最终标准名 -> 需复核
+ok = validate_alias_batch("脱盐乳清：中转名\n中转名：乳清粉",
+                          db.alias_existing())
+db.bulk_upsert_aliases(ok["entries"])
+assert db.get_review(rid_alias)["needs_recheck"] is False
+ok = validate_alias_batch("脱盐乳清：奶粉", db.alias_existing())
+db.bulk_upsert_aliases(ok["entries"])
+assert db.get_review(rid_alias)["needs_recheck"] is True
+# 无关别名变化不复核其它记录
+assert db.get_review(rid)["needs_recheck"] is False
+
+# 8e. 供应商风险预览不接入别名（脱盐乳清仍按未登记处理）
+from app.supplier_risk import analyze_supplier_risk
+risk = analyze_supplier_risk(text="脱盐乳清", plans_text="", declared=[])
+assert "脱盐乳清" in risk["unknown_ingredients"]
+print("8. 原料别名（原子校验/最短环路/链式解析/原名展示/时效复核边界/不接入风险预览） OK")
+
 print("\n全部集成冒烟测试通过 ✔")

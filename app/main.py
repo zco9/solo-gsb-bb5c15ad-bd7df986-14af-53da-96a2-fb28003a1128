@@ -2,6 +2,8 @@
 
 功能：
 - 过敏原字典管理（原料 → 过敏原集合）；
+- 原料别名管理（「别名：标准名」批量维护，有向图原子校验与链式解析，
+  仅接入正式审查与字典时效复核）；
 - 解析带嵌套子配料的配方文本，传播并汇总过敏原；
 - 对照标签声明，指出遗漏 / 多报的过敏原；
 - 支持两版配方对比，输出过敏原变化；
@@ -19,6 +21,9 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from . import db
+from .aliases import resolve_preview, validate_alias_batch
+from .analysis import flatten, normalize_name
+from .parser import parse_recipe
 from .proportion import analyze_proportions
 from .recheck import build_recheck
 from .report import render_html_report, render_markdown_report
@@ -52,6 +57,14 @@ class DictEntry(BaseModel):
 
 
 class BulkImport(BaseModel):
+    text: str
+
+
+class AliasBulkImport(BaseModel):
+    text: str
+
+
+class AliasPreview(BaseModel):
     text: str
 
 
@@ -118,6 +131,60 @@ def delete_entry(ingredient: str):
 def bulk_import(payload: BulkImport):
     imported = db.bulk_import(payload.text)
     return {"ok": True, "imported": imported}
+
+
+# ---------- 原料别名 ----------
+
+@app.get("/api/aliases")
+def get_aliases():
+    return {"aliases": db.list_aliases()}
+
+
+@app.post("/api/aliases/bulk")
+def bulk_aliases(payload: AliasBulkImport):
+    """按「别名：标准名」批量维护别名。
+
+    整批视为有向图做原子校验：格式错误、同一别名多目标、自环与任意
+    长度环都会拒绝整批（不写入任何一条）；错误返回冲突行，环错误额外
+    返回从最早冲突行展开的最短环路。合法时整批 upsert 并返回写入条数。
+    """
+    outcome = validate_alias_batch(payload.text, db.alias_existing())
+    if outcome["errors"]:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "别名批量校验未通过，整批未写入",
+                    "errors": outcome["errors"]})
+    imported = db.bulk_upsert_aliases(outcome["entries"])
+    return {"ok": True, "imported": imported}
+
+
+@app.delete("/api/aliases/{alias}")
+def delete_alias(alias: str):
+    db.delete_alias(alias)
+    return {"ok": True}
+
+
+@app.post("/api/aliases/resolve-preview")
+def alias_resolve_preview(payload: AliasPreview):
+    """别名解析预览（只读）：把配方文本中每种原料沿别名链解析到最终
+    标准名，展示解析链、最终标准名及该标准名在字典中的过敏原。
+
+    不写入任何数据，也不产生审查记录。"""
+    if not payload.text.strip():
+        raise HTTPException(400, "配方文本不能为空")
+    tree = parse_recipe(payload.text)
+    names = [n.name for n in flatten(tree)]
+    leaf_keys = {normalize_name(n.name) for n in flatten(tree)
+                 if not n.children}
+    # 展示名映射：别名原文 / 标准名原文 + 字典中登记的原料名原文
+    displays = {normalize_name(e["ingredient"]): e["ingredient"]
+                for e in db.list_dict()}
+    for e in db.list_aliases():
+        displays[normalize_name(e["alias"])] = e["alias"]
+        displays[normalize_name(e["target"])] = e["target"]
+    items = resolve_preview(names, db.alias_edges(), db.dict_lookup(),
+                            displays, leaf_keys)
+    return {"items": items}
 
 
 # ---------- 供应商方案风险区间（临时预览） ----------
